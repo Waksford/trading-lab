@@ -94,38 +94,27 @@ if %MAIN_EXIT_CODE% EQU 0 (
 
 REM ==========================================================
 REM 3. PAPER PORTFOLIO LIVE
-REM Solo si MAIN y PAPER han terminado correctamente
+REM Independiente: benchmarks y valoraciones pueden continuar aunque falle una fase previa
 REM ==========================================================
 
-if %MAIN_EXIT_CODE% EQU 0 if %PAPER_EXIT_CODE% EQU 0 (
+echo. >> "%LOG%"
+echo ====================================== >> "%LOG%"
+echo INICIANDO PAPER PORTFOLIOS >> "%LOG%"
+echo Fecha: %date% >> "%LOG%"
+echo Hora: %time% >> "%LOG%"
+echo ====================================== >> "%LOG%"
 
-    echo. >> "%LOG%"
-    echo ====================================== >> "%LOG%"
-    echo INICIANDO PAPER PORTFOLIO LIVE >> "%LOG%"
-    echo Fecha: %date% >> "%LOG%"
-    echo Hora: %time% >> "%LOG%"
-    echo ====================================== >> "%LOG%"
+python paper_portfolios_runner.py >> "%LOG%" 2>&1
 
-    python paper_portfolio_live.py >> "%LOG%" 2>&1
-
-    set PORTFOLIO_EXIT_CODE=%ERRORLEVEL%
-
-) else (
-
-    echo. >> "%LOG%"
-    echo PAPER PORTFOLIO LIVE OMITIDO POR ERROR PREVIO >> "%LOG%"
-
-    set PORTFOLIO_EXIT_CODE=0
-
-)
+set PORTFOLIO_EXIT_CODE=%ERRORLEVEL%
 
 
 REM ==========================================================
 REM 4. NEWS ANALYZER
-REM Solo si MAIN, PAPER y PORTFOLIO han terminado correctamente
+REM News depende del radar, no del resultado de las carteras paper
 REM ==========================================================
 
-if %MAIN_EXIT_CODE% EQU 0 if %PAPER_EXIT_CODE% EQU 0 if %PORTFOLIO_EXIT_CODE% EQU 0 (
+if %MAIN_EXIT_CODE% EQU 0 (
 
     echo. >> "%LOG%"
     echo ====================================== >> "%LOG%"

@@ -1,4 +1,5 @@
 import unittest
+import json
 
 from weekly_report import generar_lineas_paper_portfolio_live
 
@@ -83,6 +84,28 @@ class WeeklyPaperPortfolioLiveTest(unittest.TestCase):
         self.assertIn("Invertido: $0.00", "\n".join(lineas))
         self.assertNotIn("Mejores abiertas:", lineas)
         self.assertNotIn("Peores abiertas:", lineas)
+
+    def test_defensive_y_shy_aparecen_con_estado(self):
+        defensive = self.cartera([posicion("SHY", 1)])
+        defensive.update({
+            "name": "DEFENSIVE_CANDIDATE", "strategy": "DEFENSIVE_CANDIDATE",
+            "portfolio_type": "FORWARD_ETF", "total_costs": 5,
+            "ultimo_rebalanceo": {
+                "execution_date": "2026-10-01",
+                "ranking_json": json.dumps([{
+                    "state": "RISK_OFF", "spy_momentum60": -0.0342
+                }]),
+            },
+        })
+        salida = "\n".join(generar_lineas_paper_portfolio_live(defensive))
+        self.assertIn("Defensive Candidate", salida)
+        self.assertIn("Estado: RISK_OFF", salida)
+        self.assertIn("SPY Momentum60: -3.42%", salida)
+
+        shy = self.cartera([posicion("SHY", 1)])
+        shy.update({"name": "SHY_BUY_HOLD", "strategy": "BENCHMARK_SHY",
+                    "portfolio_type": "FORWARD_ETF"})
+        self.assertIn("SHY Buy & Hold", "\n".join(generar_lineas_paper_portfolio_live(shy)))
 
 
 if __name__ == "__main__":

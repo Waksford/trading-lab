@@ -1,5 +1,7 @@
 import os
 import smtplib
+import mimetypes
+from pathlib import Path
 
 from email.message import EmailMessage
 
@@ -11,7 +13,9 @@ load_dotenv()
 
 def enviar_email(
     asunto,
-    contenido
+    contenido,
+    html=None,
+    inline_images=None
 ):
     """
     Envía un correo usando SMTP.
@@ -98,6 +102,33 @@ def enviar_email(
     mensaje.set_content(
         contenido
     )
+
+    if html:
+        mensaje.add_alternative(
+            html,
+            subtype="html"
+        )
+
+        parte_html = mensaje.get_payload()[-1]
+
+        for cid, ruta in (inline_images or {}).items():
+            try:
+                ruta = Path(ruta)
+                tipo, _ = mimetypes.guess_type(ruta.name)
+                principal, subtipo = (
+                    tipo.split("/", 1)
+                    if tipo and "/" in tipo
+                    else ("application", "octet-stream")
+                )
+                parte_html.add_related(
+                    ruta.read_bytes(),
+                    maintype=principal,
+                    subtype=subtipo,
+                    cid=f"<{cid}>",
+                    filename=ruta.name
+                )
+            except OSError as error:
+                print(f"No se pudo adjuntar imagen inline {ruta}: {error}")
 
 
     with smtplib.SMTP(

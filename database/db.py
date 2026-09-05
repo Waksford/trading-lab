@@ -1439,6 +1439,7 @@ def asegurar_columnas_clasificacion():
 
 PAPER_VARIANTS_START_DATE = "2026-08-25"
 PAPER_PORTFOLIO_START_DATE = "2026-08-25"
+ETF_FORWARD_START_DATE = "2026-09-02"
 
 
 def _migrar_variantes_paper(cursor):
@@ -2830,8 +2831,81 @@ def inicializar_tablas_paper_portfolio():
 
         CREATE INDEX IF NOT EXISTS idx_live_equity_portfolio_date
         ON paper_portfolio_equity(portfolio_id, market_date);
+
+        CREATE TABLE IF NOT EXISTS paper_portfolio_holdings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            category TEXT,
+            shares REAL NOT NULL,
+            cost_basis REAL NOT NULL,
+            entry_date TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            last_price REAL,
+            price_stale INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(portfolio_id, symbol),
+            FOREIGN KEY(portfolio_id) REFERENCES paper_portfolios(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_portfolio_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id INTEGER NOT NULL,
+            rebalance_id INTEGER,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            price REAL NOT NULL,
+            shares REAL NOT NULL,
+            gross_value REAL NOT NULL,
+            fee REAL NOT NULL,
+            realized_pnl REAL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(portfolio_id) REFERENCES paper_portfolios(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_portfolio_rebalances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            portfolio_id INTEGER NOT NULL,
+            signal_date TEXT NOT NULL,
+            execution_date TEXT NOT NULL,
+            ranking_json TEXT,
+            selected_json TEXT,
+            target_weights_json TEXT,
+            cash_filter INTEGER NOT NULL DEFAULT 0,
+            cash_reason TEXT,
+            equity_before REAL NOT NULL,
+            equity_after REAL NOT NULL,
+            costs REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(portfolio_id, signal_date),
+            FOREIGN KEY(portfolio_id) REFERENCES paper_portfolios(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_forward_holdings_portfolio
+        ON paper_portfolio_holdings(portfolio_id);
+
+        CREATE INDEX IF NOT EXISTS idx_forward_trades_portfolio_date
+        ON paper_portfolio_trades(portfolio_id, trade_date);
         """
     )
+
+    columnas_portfolio = {
+        fila["name"]
+        for fila in cursor.execute("PRAGMA table_info(paper_portfolios)").fetchall()
+    }
+    for nombre, definicion in (
+        ("portfolio_type", "TEXT NOT NULL DEFAULT 'SIGNAL'"),
+        ("activation_date", "TEXT"),
+        ("version_identifier", "TEXT"),
+        ("total_costs", "REAL NOT NULL DEFAULT 0.0"),
+        ("last_rebalance_date", "TEXT"),
+    ):
+        if nombre not in columnas_portfolio:
+            cursor.execute(
+                f"ALTER TABLE paper_portfolios ADD COLUMN {nombre} {definicion}"
+            )
 
     ahora = datetime.now().isoformat(timespec="seconds")
     for nombre, strategy, version in (
@@ -2853,6 +2927,29 @@ def inicializar_tablas_paper_portfolio():
                 PAPER_PORTFOLIO_START_DATE,
                 ahora,
                 ahora
+            )
+        )
+
+    for nombre, strategy, version in (
+        ("ETF_TOP2_CANDIDATE", "ETF_TOP2_CANDIDATE", "candidate_frozen_v1"),
+        ("DEFENSIVE_CANDIDATE", "DEFENSIVE_CANDIDATE", "DEFENSIVE_SIMPLE_CANDIDATE_V1"),
+        ("SPY_BUY_HOLD", "BENCHMARK_SPY", "buy_hold_v1"),
+        ("BALANCED_60_40", "BENCHMARK_60_40", "spy_ief_60_40_v1"),
+        ("SHY_BUY_HOLD", "BENCHMARK_SHY", "shy_buy_hold_v1"),
+    ):
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO paper_portfolios (
+                name, strategy, source_score_version,
+                initial_capital, current_cash, start_date,
+                created_at, updated_at, status, portfolio_type,
+                activation_date, version_identifier, total_costs
+            ) VALUES (?, ?, ?, 10000.0, 10000.0, ?, ?, ?, 'ACTIVE',
+                      'FORWARD_ETF', ?, ?, 0.0)
+            """,
+            (
+                nombre, strategy, version, ETF_FORWARD_START_DATE,
+                ahora, ahora, ETF_FORWARD_START_DATE, version
             )
         )
 
@@ -2880,22 +2977,47 @@ def obtener_resumen_paper_portfolios():
             """,
             (cartera["id"],)
         ).fetchone()
-        abiertas = cursor.execute(
-            """
-            SELECT * FROM paper_portfolio_positions
-            WHERE portfolio_id = ? AND status = 'OPEN'
-            ORDER BY capital_allocated DESC, symbol
-            """,
-            (cartera["id"],)
-        ).fetchall()
-        cierres = cursor.execute(
-            """
-            SELECT * FROM paper_portfolio_positions
-            WHERE portfolio_id = ? AND status = 'CLOSED'
-            ORDER BY actual_exit_date DESC, id DESC LIMIT 5
-            """,
-            (cartera["id"],)
-        ).fetchall()
+        if item.get("portfolio_type") == "FORWARD_ETF":
+            abiertas = cursor.execute(
+                """
+                SELECT id, portfolio_id, symbol, entry_date, entry_price,
+                       shares, cost_basis AS capital_allocated,
+                       'OPEN' AS status, last_price, price_stale, category,
+                       created_at, updated_at
+                FROM paper_portfolio_holdings
+                WHERE portfolio_id = ?
+                ORDER BY cost_basis DESC, symbol
+                """,
+                (cartera["id"],)
+            ).fetchall()
+            cierres = cursor.execute(
+                """
+                SELECT id, symbol, trade_date AS actual_exit_date,
+                       'REBALANCE' AS exit_reason, realized_pnl AS pnl,
+                       NULL AS return_pct
+                FROM paper_portfolio_trades
+                WHERE portfolio_id = ? AND side = 'SELL'
+                ORDER BY trade_date DESC, id DESC LIMIT 5
+                """,
+                (cartera["id"],)
+            ).fetchall()
+        else:
+            abiertas = cursor.execute(
+                """
+                SELECT * FROM paper_portfolio_positions
+                WHERE portfolio_id = ? AND status = 'OPEN'
+                ORDER BY capital_allocated DESC, symbol
+                """,
+                (cartera["id"],)
+            ).fetchall()
+            cierres = cursor.execute(
+                """
+                SELECT * FROM paper_portfolio_positions
+                WHERE portfolio_id = ? AND status = 'CLOSED'
+                ORDER BY actual_exit_date DESC, id DESC LIMIT 5
+                """,
+                (cartera["id"],)
+            ).fetchall()
         item["equity"] = dict(equity) if equity else None
         item["max_drawdown_pct"] = cursor.execute(
             """
@@ -2906,21 +3028,54 @@ def obtener_resumen_paper_portfolios():
         ).fetchone()[0]
         item["abiertas"] = [dict(fila) for fila in abiertas]
         item["ultimos_cierres"] = [dict(fila) for fila in cierres]
+        tabla_resultados = (
+            "paper_portfolio_trades" if item.get("portfolio_type") == "FORWARD_ETF"
+            else "paper_portfolio_positions"
+        )
+        condicion = "side = 'SELL'" if tabla_resultados == "paper_portfolio_trades" else "status = 'CLOSED'"
+        campo_pnl = "realized_pnl" if tabla_resultados == "paper_portfolio_trades" else "pnl"
         item["cerradas"] = cursor.execute(
-            """
-            SELECT COUNT(*) FROM paper_portfolio_positions
-            WHERE portfolio_id = ? AND status = 'CLOSED'
-            """,
+            f"SELECT COUNT(*) FROM {tabla_resultados} WHERE portfolio_id = ? AND {condicion}",
             (cartera["id"],)
         ).fetchone()[0]
         item["pnl_realizado"] = cursor.execute(
-            """
-            SELECT COALESCE(SUM(pnl), 0.0)
-            FROM paper_portfolio_positions
-            WHERE portfolio_id = ? AND status = 'CLOSED'
-            """,
+            f"SELECT COALESCE(SUM({campo_pnl}), 0.0) FROM {tabla_resultados} "
+            f"WHERE portfolio_id = ? AND {condicion}",
             (cartera["id"],)
         ).fetchone()[0]
+        rebalanceo = cursor.execute(
+            """
+            SELECT * FROM paper_portfolio_rebalances
+            WHERE portfolio_id = ? ORDER BY execution_date DESC, id DESC LIMIT 1
+            """,
+            (cartera["id"],)
+        ).fetchone()
+        item["ultimo_rebalanceo"] = dict(rebalanceo) if rebalanceo else None
+        comunes = cursor.execute(
+            """
+            SELECT market_date, equity FROM paper_portfolio_equity
+            WHERE portfolio_id = ? AND market_date >= ?
+            ORDER BY market_date
+            """,
+            (cartera["id"], ETF_FORWARD_START_DATE)
+        ).fetchall()
+        item["common_start_date"] = None
+        item["common_return_pct"] = None
+        item["common_max_drawdown_pct"] = None
+        if comunes and comunes[0]["market_date"] == ETF_FORWARD_START_DATE:
+            inicial = float(comunes[0]["equity"])
+            pico = inicial
+            peor_dd = 0.0
+            for punto in comunes:
+                valor = float(punto["equity"])
+                pico = max(pico, valor)
+                peor_dd = min(peor_dd, (valor / pico - 1) * 100 if pico else 0.0)
+            item["common_start_date"] = ETF_FORWARD_START_DATE
+            item["common_return_pct"] = (
+                (float(comunes[-1]["equity"]) / inicial - 1) * 100
+                if inicial else None
+            )
+            item["common_max_drawdown_pct"] = peor_dd
         resultado.append(item)
 
     conexion.close()

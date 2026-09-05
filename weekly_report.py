@@ -1,4 +1,6 @@
 from datetime import datetime
+import json
+from pathlib import Path
 import re
 
 import pandas as pd
@@ -42,6 +44,7 @@ from database.db import (
     obtener_resultados_paper,
     obtener_resumen_paper,
     obtener_resumen_paper_portfolios,
+    obtener_conexion,
 
     # ========================================================
     # NEWS
@@ -54,6 +57,8 @@ from database.db import (
 from notifications.emailer import (
     enviar_email
 )
+from reporting.weekly_charts import generar_graficos_weekly
+from reporting.weekly_html import generar_html_weekly
 
 
 # ============================================================
@@ -100,7 +105,16 @@ def generar_lineas_paper_portfolio_live(cartera):
     """Genera el resumen visual de una cartera paper continua."""
 
     equity = cartera.get("equity") or {}
-    nombre = "Momentum V4" if cartera.get("strategy") == "MOMENTUM" else "Reversal V1"
+    nombres = {
+        "MOMENTUM_LIVE": "Momentum V4", "REVERSAL_LIVE": "Reversal V1",
+        "ETF_TOP2_CANDIDATE": "ETF Top-2 Candidate",
+        "DEFENSIVE_CANDIDATE": "Defensive Candidate",
+        "SPY_BUY_HOLD": "SPY Buy & Hold", "BALANCED_60_40": "60/40 SPY/IEF",
+        "SHY_BUY_HOLD": "SHY Buy & Hold",
+    }
+    nombre = nombres.get(cartera.get("name"), (
+        "Momentum V4" if cartera.get("strategy") == "MOMENTUM" else "Reversal V1"
+    ))
     retorno = numero(equity.get("return_pct"))
     spy_retorno = numero(equity.get("spy_return_pct"))
     abiertas = []
@@ -135,15 +149,22 @@ def generar_lineas_paper_portfolio_live(cartera):
         reverse=True
     )[:5]
 
-    lineas = [
-        "",
-        f"{nombre}:",
-        (
+    resumen_capital = (
+        f"Capital ${numero(equity.get('equity'), cartera.get('current_cash')):,.2f} | "
+        f"{retorno:+.2f}% | DD {numero(cartera.get('max_drawdown_pct')):+.2f}% | "
+        f"Costes ${numero(cartera.get('total_costs')):,.2f}"
+        if cartera.get("portfolio_type") == "FORWARD_ETF"
+        else (
             f"Capital ${numero(equity.get('equity'), cartera.get('current_cash')):,.2f} | "
             f"{retorno:+.2f}% | SPY {spy_retorno:+.2f}% | "
             f"Exc {retorno - spy_retorno:+.2f}pp | "
             f"DD {numero(cartera.get('max_drawdown_pct')):+.2f}%"
-        ),
+        )
+    )
+    lineas = [
+        "",
+        f"{nombre}:",
+        resumen_capital,
         (
             f"Cash: ${numero(cartera.get('current_cash')):,.2f} | "
             f"Invertido: ${capital_invertido:,.2f} | "
@@ -155,6 +176,34 @@ def generar_lineas_paper_portfolio_live(cartera):
         ),
         f"Abiertas: {len(abiertas)} | Cerradas: {entero(cartera.get('cerradas'))}"
     ]
+
+    if cartera.get("portfolio_type") == "FORWARD_ETF":
+        posiciones = ", ".join(
+            f"{texto(p.get('symbol'))} ({texto(p.get('category'))})"
+            for p in cartera.get("abiertas", [])
+        ) or "100% cash / sin posiciones"
+        lineas.append(f"Posiciones actuales: {posiciones}")
+        ultimo = cartera.get("ultimo_rebalanceo") or {}
+        lineas.append(
+            "Ultimo rebalanceo: "
+            + texto(ultimo.get("execution_date"), "pendiente primer rebalanceo valido")
+        )
+        if cartera.get("name") == "DEFENSIVE_CANDIDATE":
+            auditoria = {}
+            try:
+                ranking = json.loads(ultimo.get("ranking_json") or "[]")
+                auditoria = ranking[0] if ranking else {}
+            except (TypeError, ValueError, IndexError):
+                auditoria = {}
+            lineas.extend([
+                f"Estado: {texto(auditoria.get('state'), 'PENDIENTE')}",
+                f"Posicion: {posiciones.split(' (')[0] if cartera.get('abiertas') else 'cash'}",
+                (
+                    f"SPY Momentum60: {numero(auditoria.get('spy_momentum60')):+.2%}"
+                    if auditoria.get("spy_momentum60") is not None
+                    else "SPY Momentum60: pendiente primera decision mensual"
+                ),
+            ])
 
     for titulo, posiciones in (("Mejores abiertas:", mejores), ("Peores abiertas:", peores)):
         if posiciones:
@@ -174,6 +223,35 @@ def generar_lineas_paper_portfolio_live(cartera):
                 f"{texto(posicion.get('exit_reason'))} | "
                 f"{pnl_moneda(posicion.get('pnl'), mostrar_mas=True)}"
             )
+    return lineas
+
+
+def generar_tabla_comparativa_paper(carteras):
+    """Compara exclusivamente la ventana comun iniciada el 2026-09-02."""
+    nombres = {
+        "MOMENTUM_LIVE": "Momentum V4", "REVERSAL_LIVE": "Reversal V1",
+        "ETF_TOP2_CANDIDATE": "ETF Top-2 Candidate",
+        "DEFENSIVE_CANDIDATE": "Defensive Candidate",
+        "SPY_BUY_HOLD": "SPY Buy & Hold", "BALANCED_60_40": "60/40",
+        "SHY_BUY_HOLD": "SHY Buy & Hold",
+    }
+    spy = next((c for c in carteras if c.get("name") == "SPY_BUY_HOLD"), None)
+    spy_return = spy.get("common_return_pct") if spy else None
+    lineas = ["", "Comparativa comun desde 2026-09-02:",
+              "Portfolio                 Equity      Return     MaxDD    Exc SPY",
+              "-----------------------------------------------------------------"]
+    for cartera in carteras:
+        nombre = nombres.get(cartera.get("name"), cartera.get("name", "N/A"))
+        equity = numero((cartera.get("equity") or {}).get("equity"), cartera.get("current_cash"))
+        retorno = cartera.get("common_return_pct")
+        dd = cartera.get("common_max_drawdown_pct")
+        if retorno is None or dd is None:
+            metricas = f"${equity:>10,.2f}         N/A       N/A        N/A"
+        else:
+            exceso = retorno - spy_return if spy_return is not None else None
+            exc = f"{exceso:+7.2f}pp" if exceso is not None else "    N/A"
+            metricas = f"${equity:>10,.2f}  {retorno:+8.2f}% {dd:+8.2f}% {exc}"
+        lineas.append(f"{nombre:<24} {metricas}")
     return lineas
 
 
@@ -1627,6 +1705,304 @@ def generar_lineas_paper_compacto(
     return lineas
 
 
+PORTFOLIO_LABELS = {
+    "MOMENTUM_LIVE": "Momentum V4", "REVERSAL_LIVE": "Reversal V1",
+    "ETF_TOP2_CANDIDATE": "ETF Top-2 Candidate",
+    "DEFENSIVE_CANDIDATE": "Defensive Candidate",
+    "SPY_BUY_HOLD": "SPY — comprar y mantener", "BALANCED_60_40": "60/40 SPY/IEF",
+    "SHY_BUY_HOLD": "SHY — comprar y mantener",
+}
+BENCHMARK_PORTFOLIOS = {"SPY_BUY_HOLD", "BALANCED_60_40", "SHY_BUY_HOLD"}
+STRATEGY_OBJECTIVES = {
+    "MOMENTUM_LIVE": "Busca acciones con tendencia y fortaleza relativa.",
+    "REVERSAL_LIVE": "Busca rebotes de corto plazo tras movimientos de sobreventa.",
+    "ETF_TOP2_CANDIDATE": "Rota mensualmente entre dos ETF de categorías distintas.",
+    "DEFENSIVE_CANDIDATE": "Cambia entre SPY y SHY cuando el momentum de 60 sesiones pasa a negativo.",
+}
+
+
+def clasificar_estado_portfolio(
+    cartera,
+    observaciones_comunes,
+    spy_retorno_comun=None,
+    primera_ejecucion=True
+):
+    """Presentation-only maturity label; never a trading signal."""
+    if cartera.get("name") in BENCHMARK_PORTFOLIOS:
+        return "BENCHMARK"
+    if not primera_ejecucion:
+        return "EARLY"
+    retorno = cartera.get("common_return_pct")
+    spy = spy_retorno_comun
+    if observaciones_comunes < 20 or retorno is None:
+        return "EARLY"
+    exceso = retorno - spy if spy is not None else None
+    if observaciones_comunes >= 20 and retorno <= -5 and exceso is not None and exceso <= -3:
+        return "WEAK"
+    if observaciones_comunes >= 60 and retorno >= 0 and (exceso is None or exceso >= -1):
+        return "STABLE"
+    return "WATCH"
+
+
+def generar_contexto_semanal(prioridades, news, alertas_a):
+    frases = []
+    alta = prioridades.get("A+", 0) + prioridades.get("A", 0)
+    intermedias = prioridades.get("B", 0) + prioridades.get("C", 0)
+    frases.append(
+        "El radar muestra pocas configuraciones de maxima prioridad esta semana."
+        if alta < 5 else
+        f"El radar mantiene {alta} configuraciones A+/A para investigacion prioritaria."
+    )
+    positivos = sum(1 for n in news if n.get("contexto") == "POSITIVO")
+    negativos = sum(1 for n in news if n.get("contexto") == "NEGATIVO")
+    if positivos > negativos:
+        frases.append("El contexto informativo es mayoritariamente positivo entre las noticias analizadas.")
+    elif negativos > positivos:
+        frases.append("El contexto informativo contiene mas lecturas negativas que positivas.")
+    else:
+        frases.append("El contexto informativo no presenta una direccion dominante.")
+    if alertas_a:
+        frases.append(f"{alertas_a} configuraciones A+/A mantienen alertas tecnicas que requieren revision.")
+    elif intermedias > alta:
+        frases.append("La mayor parte de candidatos permanece en categorias intermedias.")
+    return " ".join(frases[:3])
+
+
+def _filas_tracking_html(resultados, prioridades, variant, horizontes):
+    filas = []
+    for horizonte in horizontes:
+        filtrados = [r for r in resultados if entero(r.get("horizonte")) == horizonte
+                     and texto(r.get("variant"), "BASE") == variant
+                     and r.get("prioridad") in prioridades]
+        resumen = resumir_paper(filtrados)
+        filas.append({
+            "horizon": f"{horizonte}D", "n": resumen["casos"] if resumen else 0,
+            "return": resumen["retorno_medio"] if resumen else None,
+            "excess": resumen["exceso_medio"] if resumen else None,
+            "beat": resumen["bate_spy"] if resumen else None,
+        })
+    return filas
+
+
+def portfolios_elegibles_highlights(portfolios):
+    """Excluye carteras no ejecutadas y métricas sin baseline común real."""
+    return [
+        p for p in portfolios
+        if p.get("operational")
+        and p.get("return") is not None
+        and p.get("maxdd") is not None
+    ]
+
+
+def estrategias_operativas(portfolios):
+    """Estrategias con al menos una ejecución real para highlights de madurez."""
+    return [
+        p for p in portfolios
+        if not p.get("benchmark") and p.get("operational")
+    ]
+
+
+def construir_datos_weekly_html(informe_texto, crear_graficos=True):
+    """Collect existing outputs for presentation; no score/trading calculation changes."""
+    scan_times = obtener_scan_times(limite=NUM_SCANS * 3)
+    ultimo_scan = obtener_scan_por_fecha(scan_times[0]) if scan_times else []
+    version = obtener_version_scan(ultimo_scan) if ultimo_scan else None
+    comparables = []
+    for scan_time in scan_times:
+        scan = obtener_scan_por_fecha(scan_time)
+        if scan and (not version or obtener_version_scan(scan) == version):
+            comparables.append((scan_time, scan))
+        if len(comparables) >= NUM_SCANS:
+            break
+    news = obtener_news_context_ultimo_scan()
+    fundamentals = obtener_ultimas_clasificaciones_fundamentales()
+    mapa_fund = construir_mapa_fundamentales(fundamentals)
+    analysts = [r for r in obtener_ultimos_analyst_snapshots() if r.get("source") == "YAHOO"]
+    mapa_analistas = {r["symbol"]: r for r in analysts}
+    mapa_news = construir_mapa_news(news)
+    revisiones = calcular_revisiones_symbols(mapa_analistas.keys())
+    carteras = obtener_resumen_paper_portfolios()
+
+    prioridades = {k: 0 for k in ("A+", "A", "B", "C", "D")}
+    for activo in ultimo_scan:
+        if activo.get("prioridad_estudio") in prioridades:
+            prioridades[activo["prioridad_estudio"]] += 1
+    alertas_a = sum(
+        1 for a in ultimo_scan
+        if a.get("prioridad_estudio") in ("A+", "A")
+        and formatear_alertas(a.get("alertas_estudio")) != "NINGUNA"
+    )
+
+    conexion = obtener_conexion()
+    curvas, observaciones = {}, {}
+    for cartera in carteras:
+        rows = conexion.execute(
+            "SELECT market_date, equity FROM paper_portfolio_equity WHERE portfolio_id=? ORDER BY market_date",
+            (cartera["id"],),
+        ).fetchall()
+        serie = pd.Series(
+            [float(r["equity"]) for r in rows],
+            index=pd.to_datetime([r["market_date"] for r in rows]), dtype=float,
+        )
+        label = PORTFOLIO_LABELS.get(cartera["name"], cartera["name"])
+        curvas[label] = serie
+        observaciones[cartera["name"]] = int((serie.index >= pd.Timestamp("2026-09-02")).sum())
+    conexion.close()
+
+    spy = next((c for c in carteras if c["name"] == "SPY_BUY_HOLD"), None)
+    spy_return = spy.get("common_return_pct") if spy else None
+    portfolios = []
+    for c in carteras:
+        equity = c.get("equity") or {}
+        ultimo_rebalanceo = c.get("ultimo_rebalanceo") or {}
+        primera_ejecucion = (
+            bool(ultimo_rebalanceo.get("execution_date"))
+            if c.get("portfolio_type") == "FORWARD_ETF"
+            else bool(c.get("abiertas") or c.get("cerradas"))
+        )
+        audit = {}
+        try:
+            parsed = json.loads(ultimo_rebalanceo.get("ranking_json") or "[]")
+            audit = parsed[0] if parsed else {}
+        except (TypeError, ValueError, IndexError):
+            pass
+        retorno = c.get("common_return_pct")
+        portfolios.append({
+            "name": c["name"], "label": PORTFOLIO_LABELS.get(c["name"], c["name"]),
+            "benchmark": c["name"] in BENCHMARK_PORTFOLIOS,
+            "equity": equity.get("equity", c.get("current_cash")),
+            "return": retorno, "maxdd": c.get("common_max_drawdown_pct"),
+            "excess": retorno - spy_return if retorno is not None and spy_return is not None else None,
+            "status": clasificar_estado_portfolio(
+                c,
+                observaciones.get(c["name"], 0),
+                spy_return,
+                primera_ejecucion
+            ),
+            "operational": primera_ejecucion,
+            "objective": STRATEGY_OBJECTIVES.get(c["name"], "Referencia comparativa pasiva."),
+            "open_count": len(c.get("abiertas", [])), "cash": c.get("current_cash"),
+            "defensive_state": (
+                audit.get("state", "PENDING")
+                if primera_ejecucion else "WAITING FIRST MONTHLY SIGNAL"
+            ),
+            "position": (
+                c.get("abiertas", [{}])[0].get("symbol", "cash")
+                if c.get("abiertas") else "100% CASH"
+            ),
+            "spy_momentum60": audit.get("spy_momentum60"),
+            "last_rebalance": ultimo_rebalanceo.get(
+                "execution_date",
+                "WAITING FIRST MONTHLY SIGNAL"
+            ),
+        })
+
+    apariciones = {}
+    scores = {}
+    for _, scan in comparables:
+        for a in scan[:20]:
+            apariciones[a["symbol"]] = apariciones.get(a["symbol"], 0) + 1
+        for a in scan:
+            scores.setdefault(a["symbol"], []).append(entero(a.get("score")))
+    persistent = [f"{s:<7} {n}/{len(comparables)} análisis" for s, n in
+                  sorted(apariciones.items(), key=lambda x: (-x[1], x[0]))[:5]]
+    improving = []
+    for symbol, values in scores.items():
+        if len(values) >= 2 and values[0] - values[-1] >= 5:
+            improving.append((symbol, values[0] - values[-1], values[0]))
+    improving = [f"{s:<7} {d:+d} → {now}" for s, d, now in
+                 sorted(improving, key=lambda x: (-x[1], -x[2], x[0]))[:TOP_MEJORANDO]]
+    events = [formatear_evento_compacto(e) for e in obtener_eventos_recientes(limite=5)]
+
+    candidatos = sorted(
+        [a for a in ultimo_scan if a.get("prioridad_estudio") in ("A+", "A")],
+        key=lambda a: (prioridad_orden(a.get("prioridad_estudio")), -entero(a.get("score"))),
+    )[:8]
+    top_candidates = []
+    for a in candidatos:
+        symbol = a["symbol"]
+        fund, analyst, context = mapa_fund.get(symbol), mapa_analistas.get(symbol), mapa_news.get(symbol)
+        top_candidates.append({
+            "symbol": symbol, "priority": a.get("prioridad_estudio"), "score": entero(a.get("score")),
+            "technical": f"{texto(a.get('tendencia'))} · RSI {safe_rsi(a.get('rsi'))} · RS20 {safe_pp(a.get('fuerza_20d'))}",
+            "fundamental": (f"{entero(fund.get('score_fundamental'))}/100 · {texto(fund.get('calidad_fundamental'))}" if fund else "No disponible"),
+            "analysts": (f"Potencial objetivo {safe_pct(analyst.get('upside_mean_pct'))} · n={entero(analyst.get('analyst_count'))}" if analyst else "No disponible"),
+            "news": texto(context.get("contexto"), "No disponible") if context else "No disponible",
+            "reading": generar_lectura_combinada(a, fund, context, analyst),
+        })
+
+    momentum = [r for r in obtener_resultados_paper(strategy="MOMENTUM") if r.get("source_score_version") == "v4"]
+    reversal = obtener_resultados_paper(strategy="REVERSAL")
+    tracking = [
+        {"title": "MOMENTUM V4 — BASE A+/A", "rows": _filas_tracking_html(momentum, ["A+", "A"], "BASE", (5, 20, 60))},
+        {"title": "MOMENTUM V4 — TP25 A+/A", "rows": _filas_tracking_html(momentum, ["A+", "A"], "TP25", (5,))},
+        {"title": "REVERSAL V1 — BASE A", "rows": _filas_tracking_html(reversal, ["A"], "BASE", (5, 20, 60))},
+        {"title": "REVERSAL V1 — TP10 A", "rows": _filas_tracking_html(reversal, ["A"], "TP10", (5,))},
+    ]
+
+    validos = portfolios_elegibles_highlights(portfolios)
+    strategies = estrategias_operativas(portfolios)
+    highlights = []
+    if validos:
+        riesgo_retorno = [p for p in validos if p["maxdd"] < 0]
+        highlights.extend([
+            ("Highest Return", max(validos, key=lambda p: p["return"])["label"]),
+            ("Lowest Drawdown", max(validos, key=lambda p: p["maxdd"])["label"]),
+            ("Largest Drawdown", min(validos, key=lambda p: p["maxdd"])["label"]),
+        ])
+        if riesgo_retorno:
+            highlights.append((
+                "Best Risk/Return",
+                max(riesgo_retorno, key=lambda p: p["return"] / abs(p["maxdd"]))["label"]
+            ))
+    if strategies:
+        highlights.append(("Least Mature Strategy", min(strategies, key=lambda p: observaciones.get(p["name"], 0))["label"]))
+
+    report_dir = Path(__file__).resolve().parent / "data" / "reports"
+    chart_paths = generar_graficos_weekly(curvas, report_dir) if crear_graficos else {}
+    return {
+        "meta": {"generated": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                 "market_date": texto(ultimo_scan[0].get("market_date")) if ultimo_scan else "N/A",
+                 "score_version": version or "N/A", "scans": len(comparables)},
+        "overview": {"a_plus": prioridades["A+"], "a": prioridades["A"], "b": prioridades["B"],
+                     "c": prioridades["C"], "d": prioridades["D"], "assets": len(ultimo_scan),
+                     "news_positive": sum(1 for n in news if n.get("contexto") == "POSITIVO"),
+                     "news_mixed": sum(1 for n in news if n.get("contexto") == "MIXTO"),
+                     "news_negative": sum(1 for n in news if n.get("contexto") == "NEGATIVO"),
+                     "fund_excellent": sum(1 for f in fundamentals if f.get("calidad_fundamental") == "EXCELENTE"),
+                     "fund_solid": sum(1 for f in fundamentals if f.get("calidad_fundamental") == "SOLIDA"),
+                     "fund_weak": sum(1 for f in fundamentals if f.get("calidad_fundamental") in ("DEBIL", "MUY DEBIL"))},
+        "weekly_context": generar_contexto_semanal(prioridades, news, alertas_a),
+        "portfolios": portfolios, "persistent": persistent, "improving": improving,
+        "events": events, "top_candidates": top_candidates, "paper_tracking": tracking,
+        "highlights": highlights, "plain_text": informe_texto, "charts": chart_paths,
+    }
+
+
+def generar_informe_html(informe_texto=None, crear_graficos=True):
+    """Public HTML entry point; textual report remains independently available."""
+    texto_completo = informe_texto if informe_texto is not None else generar_informe()
+    datos = construir_datos_weekly_html(texto_completo, crear_graficos)
+    return generar_html_weekly(datos), datos
+
+
+def guardar_preview_weekly(html, datos):
+    """Guarda una vista local y sustituye los CID por rutas relativas."""
+    directorio = Path(__file__).resolve().parent / "data" / "reports"
+    directorio.mkdir(parents=True, exist_ok=True)
+    preview = html
+    for clave, cid in (
+        ("equity", "weekly_equity"),
+        ("return_drawdown", "weekly_return_drawdown")
+    ):
+        ruta = (datos.get("charts") or {}).get(clave)
+        if ruta:
+            preview = preview.replace(f"cid:{cid}", Path(ruta).name)
+    destino = directorio / "weekly_report_preview.html"
+    destino.write_text(preview, encoding="utf-8")
+    return destino
+
+
 # ============================================================
 # GENERAR INFORME
 # ============================================================
@@ -2900,12 +3276,13 @@ def generar_informe():
     )
 
     lineas.append("")
-    lineas.append("PAPER PORTFOLIO LIVE")
+    lineas.append("PAPER PORTFOLIOS")
     lineas.append("=" * 84)
 
     if carteras_paper_live:
         for cartera in carteras_paper_live:
             lineas.extend(generar_lineas_paper_portfolio_live(cartera))
+        lineas.extend(generar_tabla_comparativa_paper(carteras_paper_live))
     else:
         lineas.append("Carteras paper live todavia no inicializadas.")
 
@@ -3330,6 +3707,21 @@ def main():
 
     informe = generar_informe()
 
+    html_email = None
+    imagenes_inline = {}
+
+    try:
+        html_email, datos_html = generar_informe_html(informe)
+        preview = guardar_preview_weekly(html_email, datos_html)
+        graficos = datos_html.get("charts") or {}
+        if graficos.get("equity"):
+            imagenes_inline["weekly_equity"] = graficos["equity"]
+        if graficos.get("return_drawdown"):
+            imagenes_inline["weekly_return_drawdown"] = graficos["return_drawdown"]
+        print(f"\nVista previa HTML guardada en: {preview}")
+    except Exception as error:
+        print(f"\nAVISO generando dashboard HTML: {error}")
+
     print(
         "\n"
         + informe
@@ -3352,7 +3744,9 @@ def main():
 
         enviar_email(
             asunto,
-            informe
+            informe,
+            html=html_email,
+            inline_images=imagenes_inline
         )
 
         print(

@@ -47,6 +47,7 @@ data/*
 *.db-wal
 *.sqlite
 *.sqlite3
+data/options/*.db
 
 # Logs y artefactos temporales
 *.log

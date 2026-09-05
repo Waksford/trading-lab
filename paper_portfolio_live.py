@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta
 
 from database.db import (
+    ETF_FORWARD_START_DATE,
     PAPER_PORTFOLIO_START_DATE,
     inicializar_tablas_paper,
     inicializar_tablas_paper_portfolio,
     obtener_conexion,
     obtener_resumen_paper_portfolios
 )
+from paper_portfolio_config import MOMENTUM_LIVE, REVERSAL_LIVE
 
 
 INITIAL_CAPITAL = 10_000.0
@@ -18,11 +20,11 @@ SIDE_COST_RATE = PAPER_TOTAL_COST_PCT / 2 / 100
 
 
 CONFIGURACIONES = {
-    "MOMENTUM_LIVE": {
+    MOMENTUM_LIVE: {
         "strategy": "MOMENTUM",
         "prioridades": ("A+", "A")
     },
-    "REVERSAL_LIVE": {
+    REVERSAL_LIVE: {
         "strategy": "REVERSAL",
         "prioridades": ("A",)
     }
@@ -89,7 +91,9 @@ def _senales_candidatas(
     ).fetchall()
 
 
-def procesar_paper_portfolios(historicos, fecha_hasta=None):
+def procesar_paper_portfolios(
+    historicos, fecha_hasta=None, nombres=None, incluir_forward=True
+):
     """Procesa cronologicamente carteras live con OHLC ya descargado."""
 
     datos_spy = historicos.get("SPY")
@@ -108,6 +112,10 @@ def procesar_paper_portfolios(historicos, fecha_hasta=None):
     ahora = datetime.now().isoformat(timespec="seconds")
 
     for cartera in carteras:
+        if cartera["name"] not in CONFIGURACIONES:
+            continue
+        if nombres is not None and cartera["name"] not in nombres:
+            continue
         configuracion = CONFIGURACIONES[cartera["name"]]
         cash = float(cartera["current_cash"])
         ultima_equity = cursor.execute(
@@ -344,6 +352,9 @@ def procesar_paper_portfolios(historicos, fecha_hasta=None):
 
     conexion.commit()
     conexion.close()
+    if incluir_forward:
+        from paper_etf_forward import procesar_carteras_etf_forward
+        procesar_carteras_etf_forward(historicos, fecha_hasta)
     return obtener_resumen_paper_portfolios()
 
 
@@ -381,13 +392,14 @@ def main():
         ).fetchall()
     }
     conexion.close()
-    symbols.add("SPY")
+    from research.etf_rotation_analysis import REPRESENTATIVES
+    symbols.update(item.symbol for item in REPRESENTATIVES)
 
     from paper_simulator import descargar_historico, preparar_historicos
 
     df = descargar_historico(
         symbols,
-        datetime.strptime(PAPER_PORTFOLIO_START_DATE, "%Y-%m-%d") - timedelta(days=2),
+        datetime.strptime(ETF_FORWARD_START_DATE, "%Y-%m-%d") - timedelta(days=400),
         datetime.now() + timedelta(days=1)
     )
     if df.empty:
